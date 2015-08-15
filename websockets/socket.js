@@ -43,38 +43,78 @@ extend(Socket.prototype, {
       }
     }
     else if (isPresence) {
-      if (data.signature === sign(that.secret, data.room, that.socket.id, data.userInfo)) {
+      if (data.signature === sign(that.secret, data.room, that.socket.id, data.presence)) {
+        // Validate presence, it must contain a user_id
+        if (!data.presence.user_id) {
+          that.socket.emit('jelly:subscription_error', {
+            status: 400,
+            error: 'missing_user_id',
+          });
+
+          return;
+        }
+
         that.socket
           .join(data.room, function () {
-            // Store presence info and subscription info
-            Promise
-              .join(that.store.hsetAsync(data.room, that.socket.id, JSON.stringify(data.userInfo)),
-                    that.store.hsetAsync(that.socket.id, data.room, true))
-              .then(function () {
-                return that.store.hgetallAsync(data.room);
-              })
+            var currentMembers = that.store
+              .hgetallAsync(data.room)
               .then(function (hash) {
-                var members = [];
+                var members = {};
 
-                for (var member in hash) {
-                  if (hash.hasOwnProperty(member)) {
-                    members.push(JSON.parse(hash[member]));
+                for (var socketId in hash) {
+                  if (hash.hasOwnProperty(socketId)) {
+                    var parsed = JSON.parse(hash[socketId]);
+                    members[parsed.user_id] = true;
+
                   }
                 }
 
-                return members;
-              })
-              .then(function (members) {
+                return Object.keys(members);
+              });
+
+            var addedMember = Promise
+              .join(that.store.hsetAsync(data.room, that.socket.id, JSON.stringify(data.presence)),
+                    that.store.hsetAsync(that.socket.id, data.room, true));
+
+            var newMembers = addedMember
+              .then(function () {
+                return that.store
+                  .hgetallAsync(data.room)
+                  .then(function (hash) {
+                    // Make sure we remove duplicate members (for example members
+                    // that have multiple sockets open)
+                    var members = {};
+                    var presence = [];
+
+                    for (var socketId in hash) {
+                      if (hash.hasOwnProperty(socketId)) {
+                        var parsed = JSON.parse(hash[socketId]);
+
+                        if (!members[parsed.user_id]) {
+                          members[parsed.user_id] = true;
+                          presence.push(parsed);
+                        }
+                      }
+                    }
+
+                    return presence;
+                  });
+              });
+
+            Promise
+              .join(currentMembers, addedMember, newMembers)
+              .spread(function (currentMembers, addedMember, newMembers) {
                 that.socket
                   .emit('jelly:' + data.room + ':subscription_succeeded', {
-                    members: members,
+                    members: newMembers,
                   });
-              })
-              .then(function () {
-                that.socket
-                  .broadcast
-                  .to(data.room)
-                  .emit('jelly:' + data.room + ':member_added', data.userInfo);
+
+                if (currentMembers.indexOf(data.presence.user_id) === -1) {
+                  that.socket
+                    .broadcast
+                    .to(data.room)
+                    .emit('jelly:' + data.room + ':member_added', data.presence);
+                }
               });
           });
 
@@ -102,6 +142,11 @@ extend(Socket.prototype, {
     this.store
       .hgetallAsync(this.socket.id)
       .then(function (rooms) {
+        if (!rooms) {
+          // Race condition? sometimes this is null
+          return [];
+        }
+
         return Object.keys(rooms);
       })
       .each(function (room) {
@@ -120,13 +165,35 @@ extend(Socket.prototype, {
 
     return that.store
       .hgetAsync(data.room, that.socket.id)
-      .then(function (userInfo) {
-        that.nsp
-          .in(data.room)
-          .emit('jelly:' + data.room + ':member_removed', userInfo);
-
+      .then(JSON.parse)
+      .then(function (presence) {
         return that.store
-          .hdelAsync(data.room, that.socket.id);
+          .hdelAsync(data.room, that.socket.id)
+          .then(function () {
+            that.store
+              .hgetallAsync(data.room)
+              .then(function (hash) {
+                var user_ids = [];
+
+                for (var socketId in hash) {
+                  if (hash.hasOwnProperty(socketId)) {
+                    var parsed = JSON.parse(hash[socketId]);
+                    user_ids.push(parsed.user_id);
+                  }
+                }
+
+                return user_ids;
+              })
+              .then(function (user_ids) {
+                debug(user_ids);
+                if (user_ids.indexOf(presence.user_id) === -1) {
+                  // This id is no longer in the roster, send the notification
+                  that.nsp
+                    .in(data.room)
+                    .emit('jelly:' + data.room + ':member_removed', presence);
+                }
+              });
+          });
       });
   },
 });
